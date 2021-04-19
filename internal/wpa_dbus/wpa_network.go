@@ -65,3 +65,14 @@ func (self *NetworkWPA) RemoveSignalsObserver() *NetworkWPA {
 	}
 	return self
 }
+
+func (self *NetworkWPA) Remove() *NetworkWPA {
+	log.Log.Debug("Remove")
+	if self.Error == nil {
+		if call := self.Interface.Object.Call("fi.w1.wpa_supplicant1.Interface.RemoveNetwork", 0, self.Object.Path()); call.Err == nil {
+		} else {
+			self.Error = call.Err
+		}
+	}
+	return self
+}

@@ -2,17 +2,130 @@ package wpaconnect
 
 import (
 	"errors"
-	"github.com/mark2b/wpa-connect/internal/wpa_cli"
-
 	"fmt"
 	"github.com/godbus/dbus"
 	"github.com/mark2b/wpa-connect/internal/log"
+	"github.com/mark2b/wpa-connect/internal/wpa_cli"
 	"github.com/mark2b/wpa-connect/internal/wpa_dbus"
 	"net"
 	"time"
 )
 
-func (self *connectManager) Connect(ssid string, password string, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
+func (self *connectManager) GetCurrentNetwork() ConnectionInfo {
+	self.deadTime = time.Now().Add(5 * time.Second)
+	self.context = &connectContext{}
+	self.context.scanDone = make(chan bool)
+	self.context.connectDone = make(chan bool)
+	if wpa, err := wpa_dbus.NewWPA(); err == nil {
+		wpa.WaitForSignals(self.onSignal)
+		wpa.AddSignalsObserver()
+		if wpa.ReadInterface(self.NetInterface); wpa.Error == nil {
+			iface := wpa.Interface
+			iface.AddSignalsObserver()
+			iface.ReadCurrentNetwork()
+			iface.CurrentNetwork.ReadProperties()
+			self.readNetAddress()
+			return ConnectionInfo{NetInterface: self.NetInterface, SSID: iface.CurrentNetwork.SSID,
+				IP4: self.context.ip4, IP6: self.context.ip6}
+		}
+		wpa.RemoveSignalsObserver()
+		wpa.StopWaitForSignals()
+	}
+	return ConnectionInfo{}
+}
+
+func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool, timeout time.Duration) (e error) {
+	self.deadTime = time.Now().Add(timeout)
+	self.context = &connectContext{}
+	self.context.scanDone = make(chan bool)
+	self.context.connectDone = make(chan bool)
+	if wpa, err := wpa_dbus.NewWPA(); err == nil {
+		wpa.WaitForSignals(self.onSignal)
+		wpa.AddSignalsObserver()
+		if wpa.ReadInterface(self.NetInterface); wpa.Error == nil {
+			iface := wpa.Interface
+			iface.AddSignalsObserver()
+			self.context.phaseWaitForScanDone = true
+			go func() {
+				time.Sleep(self.deadTime.Sub(time.Now()))
+				self.context.scanDone <- false
+				self.context.error = errors.New("scan timeout")
+			}()
+
+			iface.ReadCurrentNetwork()
+			previousNetwork := *iface.CurrentNetwork
+			previousNetwork.ReadProperties()
+			iface.Disconnect()
+			if iface.Scan(); iface.Error == nil {
+				// Wait for scan done
+				if <-self.context.scanDone; self.context.error == nil {
+					if iface.ReadBSSList(); iface.Error == nil {
+						bssMap := make(map[string]wpa_dbus.BSSWPA, 0)
+						for _, bss := range iface.BSSs {
+							if bss.ReadSSID(); bss.Error == nil {
+								bssMap[bss.SSID] = bss
+								log.Log.Debug(bss.SSID, bss.BSSID)
+							} else {
+								e = err
+								break
+							}
+						}
+						if e == nil {
+							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
+								SSID: ssid,
+							}, iface, password, isHidden, false); err != nil {
+								e = err
+							}
+							func() {
+								self.deadTime = time.Now().Add(timeout)
+								self.context.error = nil
+								self.context.phaseWaitForInterfaceConnected = true
+								// remove the temporary network we tried to pre-auth
+								iface.NewNetwork.Remove()
+								if previousNetwork.Select(); previousNetwork.Error == nil {
+									if connected := <-self.context.connectDone; self.context.error == nil {
+										if connected {
+											if err := self.readNetAddress(); err != nil {
+												e = err
+											}
+										} else {
+											if iface.ReadDisconnectReason(); iface.Error == nil {
+												e = errors.New(fmt.Sprintf("connection_failed, reason=%d", iface.DisconnectReason))
+											} else {
+												e = errors.New("connection_failed")
+											}
+										}
+									} else {
+										e = self.context.error
+									}
+								} else {
+									e = previousNetwork.Error
+								}
+							}()
+
+						}
+					} else {
+						e = iface.Error
+					}
+				} else {
+					e = self.context.error
+				}
+			} else {
+				e = wpa.Error
+			}
+			iface.RemoveSignalsObserver()
+		} else {
+			e = wpa.Error
+		}
+		wpa.RemoveSignalsObserver()
+		wpa.StopWaitForSignals()
+	} else {
+		e = err
+	}
+	return
+}
+
+func (self *connectManager) Connect(ssid, password string, isHidden bool, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
 	self.deadTime = time.Now().Add(timeout)
 	self.context = &connectContext{}
 	self.context.scanDone = make(chan bool)
@@ -44,18 +157,16 @@ func (self *connectManager) Connect(ssid string, password string, timeout time.D
 							}
 						}
 						if e == nil {
-							_, exists := bssMap[ssid]
 							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
 								SSID: ssid,
-							}, iface, password, !exists); err == nil {
+							}, iface, password, isHidden, true); err == nil {
 								// Connected, save configuration
 								cli := wpa_cli.WPACli{NetInterface: self.NetInterface}
-								if err := cli.SaveConfig(); err == nil {
-									connectionInfo = ConnectionInfo{NetInterface: self.NetInterface, SSID: ssid,
-										IP4: self.context.ip4, IP6: self.context.ip6}
-								} else {
+								if err := cli.SaveConfig(); err != nil {
 									e = err
 								}
+								connectionInfo = ConnectionInfo{NetInterface: self.NetInterface, SSID: ssid,
+									IP4: self.context.ip4, IP6: self.context.ip6}
 							} else {
 								e = err
 							}
@@ -81,7 +192,12 @@ func (self *connectManager) Connect(ssid string, password string, timeout time.D
 	return
 }
 
-func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.InterfaceWPA, password string, isHidden bool) (e error) {
+func (self *connectManager) SaveConfig() error {
+	wpaCli := wpa_cli.WPACli{NetInterface: self.NetInterface}
+	return wpaCli.SaveConfig()
+}
+
+func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.InterfaceWPA, password string, isHidden bool, removeAllPreviousNetwork bool) (e error) {
 	addNetworkArgs := map[string]dbus.Variant{
 		"ssid": dbus.MakeVariant(bss.SSID),
 	}
@@ -93,7 +209,10 @@ func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.I
 	} else {
 		addNetworkArgs["psk"] = dbus.MakeVariant(password)
 	}
-	if iface.RemoveAllNetworks().AddNetwork(addNetworkArgs); iface.Error == nil {
+	if removeAllPreviousNetwork {
+		iface.RemoveAllNetworks()
+	}
+	if iface.AddNetwork(addNetworkArgs); iface.Error == nil {
 		network := iface.NewNetwork
 		self.context.phaseWaitForInterfaceConnected = true
 		go func() {
