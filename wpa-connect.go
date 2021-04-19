@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-func (self *connectManager) PreAuthenticate(ssid string, password string, timeout time.Duration) (e error) {
+func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool, timeout time.Duration) (e error) {
 	self.deadTime = time.Now().Add(timeout)
 	self.context = &connectContext{}
 	self.context.scanDone = make(chan bool)
@@ -49,10 +49,9 @@ func (self *connectManager) PreAuthenticate(ssid string, password string, timeou
 							}
 						}
 						if e == nil {
-							_, exists := bssMap[ssid]
 							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
 								SSID: ssid,
-							}, iface, password, !exists, false); err != nil {
+							}, iface, password, isHidden, false); err != nil {
 								e = err
 							}
 							func() {
@@ -104,7 +103,7 @@ func (self *connectManager) PreAuthenticate(ssid string, password string, timeou
 	return
 }
 
-func (self *connectManager) Connect(ssid string, password string, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
+func (self *connectManager) Connect(ssid, password string, isHidden bool, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
 	self.deadTime = time.Now().Add(timeout)
 	self.context = &connectContext{}
 	self.context.scanDone = make(chan bool)
@@ -136,10 +135,9 @@ func (self *connectManager) Connect(ssid string, password string, timeout time.D
 							}
 						}
 						if e == nil {
-							_, exists := bssMap[ssid]
 							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
 								SSID: ssid,
-							}, iface, password, !exists, true); err == nil {
+							}, iface, password, isHidden, true); err == nil {
 								// Connected, save configuration
 								cli := wpa_cli.WPACli{NetInterface: self.NetInterface}
 								if err := cli.SaveConfig(); err != nil {
@@ -176,7 +174,6 @@ func (self *connectManager) SaveConfig() error {
 	wpaCli := wpa_cli.WPACli{NetInterface: self.NetInterface}
 	return wpaCli.SaveConfig()
 }
-
 
 func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.InterfaceWPA, password string, isHidden bool, removeAllPreviousNetwork bool) (e error) {
 	addNetworkArgs := map[string]dbus.Variant{
