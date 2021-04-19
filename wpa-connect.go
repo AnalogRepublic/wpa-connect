@@ -2,15 +2,37 @@ package wpaconnect
 
 import (
 	"errors"
-	"github.com/mark2b/wpa-connect/internal/wpa_cli"
-
 	"fmt"
 	"github.com/godbus/dbus"
 	"github.com/mark2b/wpa-connect/internal/log"
+	"github.com/mark2b/wpa-connect/internal/wpa_cli"
 	"github.com/mark2b/wpa-connect/internal/wpa_dbus"
 	"net"
 	"time"
 )
+
+func (self *connectManager) GetCurrentNetwork() ConnectionInfo {
+	self.deadTime = time.Now().Add(5 * time.Second)
+	self.context = &connectContext{}
+	self.context.scanDone = make(chan bool)
+	self.context.connectDone = make(chan bool)
+	if wpa, err := wpa_dbus.NewWPA(); err == nil {
+		wpa.WaitForSignals(self.onSignal)
+		wpa.AddSignalsObserver()
+		if wpa.ReadInterface(self.NetInterface); wpa.Error == nil {
+			iface := wpa.Interface
+			iface.AddSignalsObserver()
+			iface.ReadCurrentNetwork()
+			iface.CurrentNetwork.ReadProperties()
+			self.readNetAddress()
+			return ConnectionInfo{NetInterface: self.NetInterface, SSID: iface.CurrentNetwork.SSID,
+				IP4: self.context.ip4, IP6: self.context.ip6}
+		}
+		wpa.RemoveSignalsObserver()
+		wpa.StopWaitForSignals()
+	}
+	return ConnectionInfo{}
+}
 
 func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool, timeout time.Duration) (e error) {
 	self.deadTime = time.Now().Add(timeout)
@@ -27,7 +49,7 @@ func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool
 			go func() {
 				time.Sleep(self.deadTime.Sub(time.Now()))
 				self.context.scanDone <- false
-				self.context.error = errors.New("timeout")
+				self.context.error = errors.New("scan timeout")
 			}()
 
 			iface.ReadCurrentNetwork()
