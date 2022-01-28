@@ -34,7 +34,7 @@ func (self *connectManager) GetCurrentNetwork() ConnectionInfo {
 	return ConnectionInfo{}
 }
 
-func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool, timeout time.Duration) (e error) {
+func (self *connectManager) PreAuthenticate(request ConnectionRequest, timeout time.Duration) (e error) {
 	self.deadTime = time.Now().Add(timeout)
 	self.context = &connectContext{}
 	self.context.scanDone = make(chan bool)
@@ -62,7 +62,7 @@ func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool
 					if iface.ReadBSSList(); iface.Error == nil {
 						bssMap := make(map[string]wpa_dbus.BSSWPA, 0)
 						for _, bss := range iface.BSSs {
-							if bss.ReadSSID(); bss.Error == nil {
+							if bss.ReadSSID().ReadRSN().ReadWPA(); bss.Error == nil {
 								bssMap[bss.SSID] = bss
 								log.Log.Debug(bss.SSID, bss.BSSID)
 							} else {
@@ -71,9 +71,10 @@ func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool
 							}
 						}
 						if e == nil {
-							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
-								SSID: ssid,
-							}, iface, password, isHidden, false); err != nil {
+							bss := bssMap[request.SSID]
+							if err := self.connectToBSS(
+								&bss,
+								iface, request, false); err != nil {
 								e = err
 							}
 							func() {
@@ -125,7 +126,7 @@ func (self *connectManager) PreAuthenticate(ssid, password string, isHidden bool
 	return
 }
 
-func (self *connectManager) Connect(ssid, password string, isHidden bool, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
+func (self *connectManager) Connect(request ConnectionRequest, timeout time.Duration) (connectionInfo ConnectionInfo, e error) {
 	self.deadTime = time.Now().Add(timeout)
 	self.context = &connectContext{}
 	self.context.scanDone = make(chan bool)
@@ -148,7 +149,7 @@ func (self *connectManager) Connect(ssid, password string, isHidden bool, timeou
 					if iface.ReadBSSList(); iface.Error == nil {
 						bssMap := make(map[string]wpa_dbus.BSSWPA, 0)
 						for _, bss := range iface.BSSs {
-							if bss.ReadSSID(); bss.Error == nil {
+							if bss.ReadSSID().ReadWPA().ReadRSN(); bss.Error == nil {
 								bssMap[bss.SSID] = bss
 								log.Log.Debug(bss.SSID, bss.BSSID)
 							} else {
@@ -157,15 +158,15 @@ func (self *connectManager) Connect(ssid, password string, isHidden bool, timeou
 							}
 						}
 						if e == nil {
-							if err := self.connectToBSS(&wpa_dbus.BSSWPA{
-								SSID: ssid,
-							}, iface, password, isHidden, true); err == nil {
+							bss := bssMap[request.SSID]
+							if err := self.connectToBSS(
+								&bss, iface, request, true); err == nil {
 								// Connected, save configuration
 								cli := wpa_cli.WPACli{NetInterface: self.NetInterface}
 								if err := cli.SaveConfig(); err != nil {
 									e = err
 								}
-								connectionInfo = ConnectionInfo{NetInterface: self.NetInterface, SSID: ssid,
+								connectionInfo = ConnectionInfo{NetInterface: self.NetInterface, SSID: request.SSID,
 									IP4: self.context.ip4, IP6: self.context.ip6}
 							} else {
 								e = err
@@ -197,17 +198,29 @@ func (self *connectManager) SaveConfig() error {
 	return wpaCli.SaveConfig()
 }
 
-func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.InterfaceWPA, password string, isHidden bool, removeAllPreviousNetwork bool) (e error) {
+func (self *connectManager) connectToBSS(bss *wpa_dbus.BSSWPA, iface *wpa_dbus.InterfaceWPA, connectionRequest ConnectionRequest, removeAllPreviousNetwork bool) (e error) {
 	addNetworkArgs := map[string]dbus.Variant{
 		"ssid": dbus.MakeVariant(bss.SSID),
 	}
-	if isHidden {
+	if connectionRequest.Hidden {
 		addNetworkArgs["scan_ssid"] = dbus.MakeVariant(1)
 	}
-	if password == "" {
+	if connectionRequest.Password == "" {
 		addNetworkArgs["key_mgmt"] = dbus.MakeVariant("NONE")
 	} else {
-		addNetworkArgs["psk"] = dbus.MakeVariant(password)
+		if bss.RSNKeyMgmt[0] == "psk" {
+			addNetworkArgs["psk"] = dbus.MakeVariant(connectionRequest.Password)
+		}
+
+		if bss.RSNKeyMgmt[0] == "wpa-eap" {
+			addNetworkArgs["key_mgmt"] = dbus.MakeVariant("WPA-EAP")
+			addNetworkArgs["identity"] = dbus.MakeVariant(connectionRequest.Identity)
+			addNetworkArgs["password"] = dbus.MakeVariant(connectionRequest.Password)
+			addNetworkArgs["eap"] = dbus.MakeVariant(connectionRequest.EAP)
+			addNetworkArgs["pairwise"] = dbus.MakeVariant(connectionRequest.Pairwise)
+			addNetworkArgs["phase1"] = dbus.MakeVariant(connectionRequest.Phase1)
+			addNetworkArgs["phase2"] = dbus.MakeVariant(connectionRequest.Phase2)
+		}
 	}
 	if removeAllPreviousNetwork {
 		iface.RemoveAllNetworks()
@@ -317,8 +330,8 @@ func (self *connectManager) processInterfacePropertiesChanged(wpa *wpa_dbus.WPA,
 						self.context.connectDone <- true
 						return
 					} else if state == "disconnected" {
-						//self.context.phaseWaitForInterfaceConnected = false
-						//self.context.connectDone <- false
+						// self.context.phaseWaitForInterfaceConnected = false
+						// self.context.connectDone <- false
 						return
 					}
 				}
@@ -361,3 +374,14 @@ type connectManager struct {
 var (
 	ConnectManager = &connectManager{NetInterface: "wlan0"}
 )
+
+type ConnectionRequest struct {
+	SSID     string
+	Identity string
+	Password string
+	Hidden   bool
+	EAP      string
+	Pairwise string
+	Phase1   string
+	Phase2   string
+}
